@@ -1,211 +1,236 @@
-const express = require("express");
-const jwt = require("jsonwebtoken");
-const User = require("../models/User");
-const Music = require("../models/Music");
-const Follow = require("../models/Follow");
-const { validateRobloxAsset } = require("./roblox");
+const express = require('express');
+const jwt = require('jsonwebtoken');
+const bcrypt = require('bcryptjs');
+const prisma = require('../lib/prisma');
+const { sendVerificationEmail } = require('../utils/email');
 
 const router = express.Router();
 
-const authMiddleware = async (req, res, next) => {
-  try {
-    const authHeader = req.headers.authorization;
+const generateToken = (user) =>
+  jwt.sign(
+    { id: user.id, username: user.username, email: user.email },
+    process.env.JWT_SECRET || 'roid_secret_key',
+    { expiresIn: process.env.JWT_EXPIRES_IN || '7d' }
+  );
 
-    if (!authHeader || !authHeader.startsWith("Bearer ")) {
-      return res.status(401).json({ message: "Oturum açmanız gerekiyor." });
+const createVerificationCode = async (user, purpose, email) => {
+  const code = Math.floor(100000 + Math.random() * 900000).toString();
+  const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
+
+  await prisma.verificationCode.deleteMany({
+    where: { userId: user.id, purpose, email: email.toLowerCase() },
+  });
+
+  await prisma.verificationCode.create({
+    data: {
+      userId: user.id,
+      code,
+      purpose,
+      email: email.toLowerCase(),
+      expiresAt,
+    },
+  });
+
+  await sendVerificationEmail(email, code, purpose);
+  return code;
+};
+
+router.post('/register', async (req, res) => {
+  try {
+    const { username, email, password } = req.body;
+
+    if (!username || !email || !password) {
+      return res.status(400).json({ message: 'Tüm alanlar zorunludur.' });
     }
 
-    const token = authHeader.split(" ")[1];
-    const decoded = jwt.verify(token, process.env.JWT_SECRET || "roid_secret_key");
-    const user = await User.findById(decoded.id);
+    if (password.length < 6) {
+      return res.status(400).json({ message: 'Şifre en az 6 karakter olmalıdır.' });
+    }
+
+    const normalizedEmail = String(email).trim().toLowerCase();
+    const normalizedUsername = String(username).trim();
+
+    const existingUser = await prisma.user.findFirst({
+      where: {
+        OR: [{ email: normalizedEmail }, { username: normalizedUsername }],
+      },
+    });
+
+    if (existingUser) {
+      return res.status(409).json({ message: 'Bu e-posta veya kullanıcı adı kullanılmaktadır.' });
+    }
+
+    const hashedPassword = await bcrypt.hash(password, 10);
+
+    const user = await prisma.user.create({
+      data: {
+        username: normalizedUsername,
+        email: normalizedEmail,
+        password: hashedPassword,
+        isAdmin: normalizedEmail === (process.env.ADMIN_EMAIL || 'admin@roid.local').toLowerCase(),
+      },
+      select: {
+        id: true,
+        username: true,
+        email: true,
+      },
+    });
+
+    await createVerificationCode({ id: user.id }, 'register', user.email);
+
+    res.status(201).json({
+      message: 'Kayıt başarılı. E-posta adresinize doğrulama kodu gönderildi.',
+      user,
+    });
+  } catch (error) {
+    console.error('Register error:', error);
+    res.status(500).json({ message: 'Kayıt sırasında hata oluştu.' });
+  }
+});
+
+router.post('/verify-email', async (req, res) => {
+  try {
+    const { email, code } = req.body;
+
+    if (!email || !code) {
+      return res.status(400).json({ message: 'E-posta ve kod gerekli.' });
+    }
+
+    const normalizedEmail = String(email).trim().toLowerCase();
+    const user = await prisma.user.findUnique({ where: { email: normalizedEmail } });
 
     if (!user) {
-      return res.status(401).json({ message: "Geçersiz kullanıcı." });
+      return res.status(404).json({ message: 'Kullanıcı bulunamadı.' });
+    }
+
+    const verification = await prisma.verificationCode.findFirst({
+      where: { userId: user.id, email: normalizedEmail },
+      orderBy: { createdAt: 'desc' },
+    });
+
+    if (!verification || verification.code !== code) {
+      return res.status(400).json({ message: 'Kod yanlış veya bulunamadı.' });
+    }
+
+    if (new Date() > verification.expiresAt) {
+      return res.status(400).json({ message: 'Kod süresi doldu.' });
+    }
+
+    await prisma.user.update({
+      where: { id: user.id },
+      data: { isVerified: true },
+    });
+
+    await prisma.verificationCode.deleteMany({ where: { userId: user.id } });
+
+    const updatedUser = await prisma.user.findUnique({
+      where: { id: user.id },
+      select: {
+        id: true,
+        username: true,
+        email: true,
+        isVerified: true,
+        isAdmin: true,
+        theme: true,
+      },
+    });
+
+    const token = generateToken(updatedUser);
+
+    res.json({
+      message: 'E-posta doğrulandı.',
+      token,
+      user: updatedUser,
+    });
+  } catch (error) {
+    console.error('Verify error:', error);
+    res.status(500).json({ message: 'Doğrulama sırasında hata.' });
+  }
+});
+
+router.post('/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+
+    if (!email || !password) {
+      return res.status(400).json({ message: 'E-posta ve şifre gerekli.' });
+    }
+
+    const normalizedEmail = String(email).trim().toLowerCase();
+    const user = await prisma.user.findUnique({ where: { email: normalizedEmail } });
+
+    if (!user) {
+      return res.status(401).json({ message: 'Kullanıcı bulunamadı.' });
     }
 
     if (user.banned) {
-      return res.status(403).json({ message: "Bu hesap banlanmıştır." });
+      return res.status(403).json({ message: 'Hesabınız banlanmıştır.' });
     }
 
-    req.user = user;
-    next();
-  } catch (error) {
-    return res.status(401).json({ message: "Geçersiz token." });
-  }
-};
-
-router.get("/", async (req, res) => {
-  try {
-    const { search = "" } = req.query;
-
-    const query = {
-      status: "approved",
-    };
-
-    if (search) {
-      query.title = { $regex: search, $options: "i" };
+    const isMatch = await bcrypt.compare(password, user.password);
+    if (!isMatch) {
+      return res.status(401).json({ message: 'Şifre yanlış.' });
     }
 
-    const musics = await Music.find(query)
-      .populate("addedBy", "username isBlueVerified isAdmin")
-      .sort({ createdAt: -1 });
-
-    res.json({ musics });
-  } catch (error) {
-    console.error("Get music error:", error);
-    res.status(500).json({ message: "Müzikler yüklenirken hata oluştu." });
-  }
-});
-
-router.get("/:id", async (req, res) => {
-  try {
-    const music = await Music.findById(req.params.id).populate("addedBy", "username isBlueVerified isAdmin");
-
-    if (!music) {
-      return res.status(404).json({ message: "Müzik bulunamadı." });
+    if (!user.isVerified) {
+      await createVerificationCode(user, 'register', user.email);
+      return res.status(403).json({ message: 'E-posta doğrulanmadı. Yeni kod gönderildi.' });
     }
 
-    res.json({ music });
-  } catch (error) {
-    console.error("Get music by id error:", error);
-    res.status(500).json({ message: "Müzik detayları getirilemedi." });
-  }
-});
-
-router.post("/", authMiddleware, async (req, res) => {
-  try {
-    const { title, robloxId, tag } = req.body;
-
-    if (!title || !robloxId) {
-      return res.status(400).json({ message: "Şarkı adı ve Roblox ID gerekli." });
-    }
-
-    if (!req.user.isVerified) {
-      return res.status(403).json({ message: "Müzik paylaşmadan önce e-posta doğrulamanız gerekli." });
-    }
-
-    if (req.user.banned) {
-      return res.status(403).json({ message: "Hesabınız engellendiği için müzik paylaşamazsınız." });
-    }
-
-    const robloxCheck = await validateRobloxAsset(robloxId);
-
-    const newMusic = new Music({
-      title,
-      robloxId,
-      tag: tag || "New",
-      addedBy: req.user._id,
-      validationStatus: robloxCheck.valid ? "working" : "broken",
-      status: robloxCheck.valid ? "pending" : "broken",
-      likes: [],
-      dislikes: [],
-    });
-
-    await newMusic.save();
-
-    const populatedMusic = await Music.findById(newMusic._id).populate("addedBy", "username isBlueVerified");
-
-    res.status(201).json({
-      message: "Müzik gönderimi yapıldı. Admin onayı bekliyor.",
-      music: populatedMusic,
-    });
-  } catch (error) {
-    console.error("Add music error:", error);
-    res.status(500).json({ message: "Müzik eklenirken hata oluştu." });
-  }
-});
-
-router.post("/:id/like", authMiddleware, async (req, res) => {
-  try {
-    const music = await Music.findById(req.params.id);
-
-    if (!music) {
-      return res.status(404).json({ message: "Müzik bulunamadı." });
-    }
-
-    const userId = req.user._id.toString();
-
-    if (music.likes.includes(userId)) {
-      music.likes = music.likes.filter((id) => id.toString() !== userId);
-    } else {
-      music.likes.push(userId);
-      music.dislikes = music.dislikes.filter((id) => id.toString() !== userId);
-    }
-
-    await music.save();
-    res.json({ message: "Like güncellendi.", music });
-  } catch (error) {
-    console.error("Like error:", error);
-    res.status(500).json({ message: "Like işlemi sırasında hata oluştu." });
-  }
-});
-
-router.post("/:id/dislike", authMiddleware, async (req, res) => {
-  try {
-    const music = await Music.findById(req.params.id);
-
-    if (!music) {
-      return res.status(404).json({ message: "Müzik bulunamadı." });
-    }
-
-    const userId = req.user._id.toString();
-
-    if (music.dislikes.includes(userId)) {
-      music.dislikes = music.dislikes.filter((id) => id.toString() !== userId);
-    } else {
-      music.dislikes.push(userId);
-      music.likes = music.likes.filter((id) => id.toString() !== userId);
-    }
-
-    await music.save();
-    res.json({ message: "Dislike güncellendi.", music });
-  } catch (error) {
-    console.error("Dislike error:", error);
-    res.status(500).json({ message: "Dislike işlemi sırasında hata oluştu." });
-  }
-});
-
-router.delete("/:id", authMiddleware, async (req, res) => {
-  try {
-    const music = await Music.findById(req.params.id);
-
-    if (!music) {
-      return res.status(404).json({ message: "Müzik bulunamadı." });
-    }
-
-    if (music.addedBy.toString() !== req.user._id.toString() && !req.user.isAdmin) {
-      return res.status(403).json({ message: "Bu müziği silmeye yetkiniz yok." });
-    }
-
-    await music.deleteOne();
-    res.json({ message: "Müzik silindi." });
-  } catch (error) {
-    console.error("Delete music error:", error);
-    res.status(500).json({ message: "Müzik silinirken hata oluştu." });
-  }
-});
-
-router.get("/user/:userId", async (req, res) => {
-  try {
-    const user = await User.findById(req.params.userId).select("-password");
-
-    if (!user) {
-      return res.status(404).json({ message: "Kullanıcı bulunamadı." });
-    }
-
-    const musicList = await Music.find({ addedBy: user._id, status: "approved" }).sort({ createdAt: -1 });
-    const followCount = await Follow.countDocuments({ following: user._id });
-    const followingCount = await Follow.countDocuments({ follower: user._id });
+    const token = generateToken(user);
 
     res.json({
-      user,
-      music: musicList,
-      followCount,
-      followingCount,
+      message: 'Giriş başarılı.',
+      token,
+      user: {
+        id: user.id,
+        username: user.username,
+        email: user.email,
+        isVerified: user.isVerified,
+        isAdmin: user.isAdmin,
+        theme: user.theme,
+        isBlueVerified: user.isBlueVerified,
+      },
     });
   } catch (error) {
-    console.error("User music profile error:", error);
-    res.status(500).json({ message: "Profil bilgisi alınamadı." });
+    console.error('Login error:', error);
+    res.status(500).json({ message: 'Giriş sırasında hata.' });
+  }
+});
+
+router.get('/me', async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({ message: 'Token gerekli.' });
+    }
+
+    const token = authHeader.split(' ')[1];
+    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'roid_secret_key');
+
+    const user = await prisma.user.findUnique({
+      where: { id: decoded.id },
+      select: {
+        id: true,
+        username: true,
+        email: true,
+        isVerified: true,
+        isAdmin: true,
+        isBlueVerified: true,
+        banned: true,
+        theme: true,
+        bio: true,
+        createdAt: true,
+      },
+    });
+
+    if (!user) {
+      return res.status(404).json({ message: 'Kullanıcı bulunamadı.' });
+    }
+
+    res.json({ user });
+  } catch (error) {
+    res.status(401).json({ message: 'Token geçersiz.' });
   }
 });
 

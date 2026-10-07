@@ -1,168 +1,269 @@
 const express = require('express');
 const jwt = require('jsonwebtoken');
-const User = require('../models/User');
-const Music = require('../models/Music');
+const prisma = require('../lib/prisma');
+const { validateRobloxAsset } = require('./roblox');
 
 const router = express.Router();
 
-const adminMiddleware = async (req, res, next) => {
+const authMiddleware = async (req, res, next) => {
   try {
     const authHeader = req.headers.authorization;
+
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return res.status(401).json({ message: 'Admin yetkisi gerekli.' });
+      return res.status(401).json({ message: 'Oturum açmanız gerekiyor.' });
     }
 
     const token = authHeader.split(' ')[1];
     const decoded = jwt.verify(token, process.env.JWT_SECRET || 'roid_secret_key');
+    const user = await prisma.user.findUnique({ where: { id: decoded.id } });
 
-    const user = await User.findById(decoded.id);
-    if (!user || !user.isAdmin) {
-      return res.status(403).json({ message: 'Bu işlem için admin yetkisi gerekir.' });
+    if (!user) {
+      return res.status(401).json({ message: 'Geçersiz kullanıcı.' });
+    }
+
+    if (user.banned) {
+      return res.status(403).json({ message: 'Bu hesap banlanmıştır.' });
     }
 
     req.user = user;
     next();
   } catch (error) {
-    return res.status(401).json({ message: 'Token geçersiz.' });
+    return res.status(401).json({ message: 'Geçersiz token.' });
   }
 };
 
-// Tüm kullanıcıları getir
-router.get('/users', adminMiddleware, async (req, res) => {
+router.get('/', async (req, res) => {
   try {
-    const users = await User.find({}).select('-password').sort({ createdAt: -1 });
-    res.json({ users });
-  } catch (error) {
-    console.error('Get users error:', error);
-    res.status(500).json({ message: 'Kullanıcılar yüklenemedi.' });
-  }
-});
+    const { search = '' } = req.query;
 
-// Bekleyen müzikleri getir
-router.get('/pending-music', adminMiddleware, async (req, res) => {
-  try {
-    const musics = await Music.find({ status: 'pending' })
-      .populate('addedBy', 'username email')
-      .sort({ createdAt: -1 });
+    const musics = await prisma.music.findMany({
+      where: {
+        status: 'approved',
+        ...(search
+          ? {
+              title: {
+                contains: String(search),
+                mode: 'insensitive',
+              },
+            }
+          : {}),
+      },
+      include: {
+        addedBy: {
+          select: {
+            id: true,
+            username: true,
+            isBlueVerified: true,
+            isAdmin: true,
+          },
+        },
+      },
+      orderBy: { createdAt: 'desc' },
+    });
 
     res.json({ musics });
   } catch (error) {
-    console.error('Get pending music error:', error);
-    res.status(500).json({ message: 'Bekleyen müzikler yüklenemedi.' });
+    console.error('Get music error:', error);
+    res.status(500).json({ message: 'Müzikler yüklenirken hata oluştu.' });
   }
 });
 
-// Müzik onaylama
-router.post('/music/:id/approve', adminMiddleware, async (req, res) => {
+router.get('/:id', async (req, res) => {
   try {
-    const music = await Music.findById(req.params.id);
+    const music = await prisma.music.findUnique({
+      where: { id: req.params.id },
+      include: {
+        addedBy: {
+          select: {
+            id: true,
+            username: true,
+            isBlueVerified: true,
+            isAdmin: true,
+          },
+        },
+      },
+    });
+
     if (!music) {
       return res.status(404).json({ message: 'Müzik bulunamadı.' });
     }
 
-    music.status = 'approved';
-    music.validationStatus = music.validationStatus || 'working';
-    music.adminNotes = req.body.adminNotes || '';
-    await music.save();
-
-    res.json({ message: 'Müzik onaylandı.', music });
+    res.json({ music });
   } catch (error) {
-    console.error('Approve music error:', error);
-    res.status(500).json({ message: 'Onay işlemi sırasında hata oluştu.' });
+    console.error('Get music by id error:', error);
+    res.status(500).json({ message: 'Müzik detayları getirilemedi.' });
   }
 });
 
-// Müzik reddetme
-router.post('/music/:id/reject', adminMiddleware, async (req, res) => {
+router.post('/', authMiddleware, async (req, res) => {
   try {
-    const music = await Music.findById(req.params.id);
-    if (!music) {
-      return res.status(404).json({ message: 'Müzik bulunamadı.' });
+    const { title, robloxId, tag } = req.body;
+
+    if (!title || !robloxId) {
+      return res.status(400).json({ message: 'Şarkı adı ve Roblox ID gerekli.' });
     }
 
-    music.status = 'rejected';
-    music.adminNotes = req.body.adminNotes || 'Admin tarafından reddedildi.';
-    await music.save();
-
-    res.json({ message: 'Müzik reddedildi.', music });
-  } catch (error) {
-    console.error('Reject music error:', error);
-    res.status(500).json({ message: 'Reddetme işlemi sırasında hata oluştu.' });
-  }
-});
-
-// Kullanıcıyı banlama
-router.post('/users/:id/ban', adminMiddleware, async (req, res) => {
-  try {
-    const user = await User.findById(req.params.id);
-    if (!user) {
-      return res.status(404).json({ message: 'Kullanıcı bulunamadı.' });
+    if (!req.user.isVerified) {
+      return res.status(403).json({ message: 'Müzik paylaşmadan önce e-posta doğrulamanız gerekli.' });
     }
 
-    user.banned = true;
-    await user.save();
-
-    res.json({ message: 'Kullanıcı banlandı.', user });
-  } catch (error) {
-    console.error('Ban user error:', error);
-    res.status(500).json({ message: 'Ban işlemi sırasında hata oluştu.' });
-  }
-});
-
-// Kullanıcıyı unbanlama
-router.post('/users/:id/unban', adminMiddleware, async (req, res) => {
-  try {
-    const user = await User.findById(req.params.id);
-    if (!user) {
-      return res.status(404).json({ message: 'Kullanıcı bulunamadı.' });
+    if (req.user.banned) {
+      return res.status(403).json({ message: 'Hesabınız engellendiği için müzik paylaşamazsınız.' });
     }
 
-    user.banned = false;
-    await user.save();
+    const robloxCheck = await validateRobloxAsset(robloxId);
+    const music = await prisma.music.create({
+      data: {
+        title,
+        robloxId,
+        tag: tag || 'New',
+        addedById: req.user.id,
+        validationStatus: robloxCheck.valid ? 'working' : 'broken',
+        status: robloxCheck.valid ? 'pending' : 'broken',
+        likes: [],
+        dislikes: [],
+      },
+      include: {
+        addedBy: {
+          select: {
+            id: true,
+            username: true,
+            isBlueVerified: true,
+          },
+        },
+      },
+    });
 
-    res.json({ message: 'Kullanıcı ban kaldırıldı.', user });
-  } catch (error) {
-    console.error('Unban user error:', error);
-    res.status(500).json({ message: 'Ban kaldırma işlemi sırasında hata oluştu.' });
-  }
-});
-
-// Kullanıcıyı silme
-router.delete('/users/:id/delete', adminMiddleware, async (req, res) => {
-  try {
-    const user = await User.findById(req.params.id);
-    if (!user) {
-      return res.status(404).json({ message: 'Kullanıcı bulunamadı.' });
-    }
-
-    await user.deleteOne();
-    await Music.deleteMany({ addedBy: user._id });
-
-    res.json({ message: 'Kullanıcı ve müzikleri silindi.' });
-  } catch (error) {
-    console.error('Delete user error:', error);
-    res.status(500).json({ message: 'Silme işlemi sırasında hata oluştu.' });
-  }
-});
-
-// Mavi tik verme/kaldırma
-router.post('/users/:id/blue-verify', adminMiddleware, async (req, res) => {
-  try {
-    const user = await User.findById(req.params.id);
-    if (!user) {
-      return res.status(404).json({ message: 'Kullanıcı bulunamadı.' });
-    }
-
-    user.isBlueVerified = !user.isBlueVerified;
-    await user.save();
-
-    res.json({
-      message: user.isBlueVerified ? 'Mavi tik verildi.' : 'Mavi tik kaldırıldı.',
-      user,
+    res.status(201).json({
+      message: 'Müzik gönderimi yapıldı. Admin onayı bekliyor.',
+      music,
     });
   } catch (error) {
-    console.error('Blue verify error:', error);
-    res.status(500).json({ message: 'Mavi tik işlemi sırasında hata oluştu.' });
+    console.error('Add music error:', error);
+    res.status(500).json({ message: 'Müzik eklenirken hata oluştu.' });
+  }
+});
+
+router.post('/:id/like', authMiddleware, async (req, res) => {
+  try {
+    const music = await prisma.music.findUnique({ where: { id: req.params.id } });
+
+    if (!music) {
+      return res.status(404).json({ message: 'Müzik bulunamadı.' });
+    }
+
+    const likes = music.likes || [];
+    const dislikes = music.dislikes || [];
+    const userId = req.user.id;
+
+    let updatedLikes = likes;
+    let updatedDislikes = dislikes;
+
+    if (likes.includes(userId)) {
+      updatedLikes = likes.filter((id) => id !== userId);
+    } else {
+      updatedLikes = [...likes, userId];
+      updatedDislikes = dislikes.filter((id) => id !== userId);
+    }
+
+    const updatedMusic = await prisma.music.update({
+      where: { id: music.id },
+      data: {
+        likes: updatedLikes,
+        dislikes: updatedDislikes,
+      },
+    });
+
+    res.json({ message: 'Like güncellendi.', music: updatedMusic });
+  } catch (error) {
+    console.error('Like error:', error);
+    res.status(500).json({ message: 'Like işlemi sırasında hata oluştu.' });
+  }
+});
+
+router.post('/:id/dislike', authMiddleware, async (req, res) => {
+  try {
+    const music = await prisma.music.findUnique({ where: { id: req.params.id } });
+
+    if (!music) {
+      return res.status(404).json({ message: 'Müzik bulunamadı.' });
+    }
+
+    const likes = music.likes || [];
+    const dislikes = music.dislikes || [];
+    const userId = req.user.id;
+
+    let updatedLikes = likes;
+    let updatedDislikes = dislikes;
+
+    if (dislikes.includes(userId)) {
+      updatedDislikes = dislikes.filter((id) => id !== userId);
+    } else {
+      updatedDislikes = [...dislikes, userId];
+      updatedLikes = likes.filter((id) => id !== userId);
+    }
+
+    const updatedMusic = await prisma.music.update({
+      where: { id: music.id },
+      data: {
+        likes: updatedLikes,
+        dislikes: updatedDislikes,
+      },
+    });
+
+    res.json({ message: 'Dislike güncellendi.', music: updatedMusic });
+  } catch (error) {
+    console.error('Dislike error:', error);
+    res.status(500).json({ message: 'Dislike işlemi sırasında hata oluştu.' });
+  }
+});
+
+router.delete('/:id', authMiddleware, async (req, res) => {
+  try {
+    const music = await prisma.music.findUnique({ where: { id: req.params.id } });
+
+    if (!music) {
+      return res.status(404).json({ message: 'Müzik bulunamadı.' });
+    }
+
+    if (music.addedById !== req.user.id && !req.user.isAdmin) {
+      return res.status(403).json({ message: 'Bu müziği silmeye yetkiniz yok.' });
+    }
+
+    await prisma.music.delete({ where: { id: music.id } });
+    res.json({ message: 'Müzik silindi.' });
+  } catch (error) {
+    console.error('Delete music error:', error);
+    res.status(500).json({ message: 'Müzik silinirken hata oluştu.' });
+  }
+});
+
+router.get('/user/:userId', async (req, res) => {
+  try {
+    const user = await prisma.user.findUnique({
+      where: { id: req.params.userId },
+      select: {
+        id: true,
+        username: true,
+      },
+    });
+
+    if (!user) {
+      return res.status(404).json({ message: 'Kullanıcı bulunamadı.' });
+    }
+
+    const music = await prisma.music.findMany({
+      where: { addedById: user.id, status: 'approved' },
+      orderBy: { createdAt: 'desc' },
+    });
+
+    const followCount = await prisma.follow.count({ where: { followingId: user.id } });
+    const followingCount = await prisma.follow.count({ where: { followerId: user.id } });
+
+    res.json({ user, music, followCount, followingCount });
+  } catch (error) {
+    console.error('User music profile error:', error);
+    res.status(500).json({ message: 'Profil bilgisi alınamadı.' });
   }
 });
 

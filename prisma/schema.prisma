@@ -1,0 +1,69 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("POSTGRES_URL")
+}
+
+model User {
+  id              String            @id @default(cuid())
+  username        String            @unique
+  email           String            @unique
+  password        String
+  isVerified      Boolean           @default(false)
+  isAdmin         Boolean           @default(false)
+  isBlueVerified  Boolean           @default(false)
+  banned          Boolean           @default(false)
+  theme           String            @default("dark")
+  bio             String            @default("")
+  createdAt       DateTime          @default(now())
+  updatedAt       DateTime          @updatedAt
+
+  musicPosts      Music[]
+  followsGiven    Follow[]          @relation("FollowerRelation")
+  followsReceived Follow[]          @relation("FollowingRelation")
+  verificationCodes VerificationCode[]
+}
+
+model Music {
+  id               String   @id @default(cuid())
+  title            String
+  robloxId         String
+  tag              String   @default("New")
+  addedById        String
+  likes            String[] @default([])
+  dislikes         String[] @default([])
+  validationStatus String   @default("broken")
+  status           String   @default("pending")
+  adminNotes       String   @default("")
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  addedBy User @relation(fields: [addedById], references: [id])
+}
+
+model Follow {
+  id          String   @id @default(cuid())
+  followerId  String
+  followingId String
+  createdAt   DateTime @default(now())
+
+  follower  User @relation("FollowerRelation", fields: [followerId], references: [id])
+  following User @relation("FollowingRelation", fields: [followingId], references: [id])
+
+  @@unique([followerId, followingId])
+}
+
+model VerificationCode {
+  id        String   @id @default(cuid())
+  userId    String
+  code      String
+  purpose   String
+  email     String
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id])
+}
